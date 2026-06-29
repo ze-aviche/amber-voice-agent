@@ -1,5 +1,5 @@
 import { Routes, Route, NavLink, useParams } from 'react-router-dom'
-import { Phone, LayoutDashboard, Settings, PlusCircle, Mic, Radio } from 'lucide-react'
+import { Phone, LayoutDashboard, Settings, PlusCircle, Mic, Radio, Landmark } from 'lucide-react'
 import { clsx } from 'clsx'
 import { useQuery } from '@tanstack/react-query'
 import { api } from './api'
@@ -8,6 +8,7 @@ import CallLog from './pages/CallLog'
 import CallDetail from './pages/CallDetail'
 import TenantSettings from './pages/TenantSettings'
 import LiveMonitor from './pages/LiveMonitor'
+import LoanDashboard from './pages/LoanDashboard'
 
 function Sidebar({ tenantId }: { tenantId?: string }) {
   const navItem = (to: string, icon: React.ReactNode, label: string) => (
@@ -36,6 +37,7 @@ function Sidebar({ tenantId }: { tenantId?: string }) {
 
       {navItem('/onboard', <PlusCircle size={16} />, 'New Client')}
       {navItem('/monitor', <Radio size={16} />, 'Live Monitor')}
+      {navItem('/loans', <Landmark size={16} />, 'Loan Processing')}
 
       {tenantId && (
         <>
@@ -119,6 +121,12 @@ export default function App() {
         <div className="flex h-screen overflow-hidden">
           <Sidebar />
           <main className="flex-1 overflow-y-auto p-8"><LiveMonitor /></main>
+        </div>
+      } />
+      <Route path="/loans" element={
+        <div className="flex h-screen overflow-hidden">
+          <Sidebar />
+          <main className="flex-1 overflow-y-auto p-8"><LoanDashboard /></main>
         </div>
       } />
       <Route path="/:tenantId/*" element={<TenantLayout />} />

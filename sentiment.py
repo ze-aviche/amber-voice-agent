@@ -16,7 +16,9 @@ The score (0.0–1.0) represents confidence in the label, not severity.
 """
 
 import asyncio
+import json
 import os
+import re
 from typing import Literal
 
 import anthropic
@@ -37,7 +39,7 @@ Rules:
 - "distressed" means urgency or fear (fraud, emergency, health). Takes priority over angry.
 - "frustrated" = mild irritation, asking the same thing twice, sighing language.
 - If there are no customer turns yet, return neutral with score 0.5.
-- Respond with ONLY the JSON object. No markdown, no explanation outside the JSON.
+- Respond with ONLY the raw JSON object. No markdown fences, no explanation, no extra text.
 
 Transcript (last {n} turns):
 {transcript}
@@ -78,8 +80,12 @@ async def analyze_sentiment(
             max_tokens=128,
             messages=[{"role": "user", "content": prompt}],
         )
-        import json
         raw = resp.content[0].text.strip()
+        # Strip markdown code fences if Claude wraps the JSON (e.g. ```json ... ```)
+        raw = re.sub(r"^```[a-z]*\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw).strip()
+        if not raw:
+            raise ValueError("Empty response from model")
         result = json.loads(raw)
         # Validate shape
         label = result.get("label", "neutral")

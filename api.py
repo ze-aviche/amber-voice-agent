@@ -308,6 +308,161 @@ def api_live_call(call_id: str):
 
 
 # ---------------------------------------------------------------------------
+# Loan Processing — LangGraph endpoints
+# ---------------------------------------------------------------------------
+
+class LoanApplicationRequest(BaseModel):
+    customer_id: str
+    customer_name: str
+    business_name: str
+    business_ein: str
+    requested_amount: float
+    loan_purpose: str
+
+
+class UnderwriterDecision(BaseModel):
+    decision: str          # "approved" | "declined"
+    underwriter_id: str
+    notes: str = ""
+
+
+@app.post("/api/loans", status_code=202)
+async def api_start_loan(body: LoanApplicationRequest):
+    """
+    Start a new loan application. Kicks off the LangGraph workflow async.
+    Returns immediately with the application_id — graph runs in background.
+
+    Demo flow:
+      POST /api/loans          → application_id returned
+      GET  /api/loans/{id}     → poll status (parallel checks running...)
+      GET  /api/loans/{id}     → status = "manual_review", is_interrupted = true
+      POST /api/loans/{id}/decision → underwriter approves/declines
+      GET  /api/loans/{id}     → status = "offer_generation", offer terms visible
+    """
+    from loan.graph import get_loan_graph
+    from datetime import datetime, timezone
+
+    app_id = f"LOAN-{uuid.uuid4().hex[:8].upper()}"
+    config = {"configurable": {"thread_id": app_id}}
+    loan_graph = await get_loan_graph()
+
+    initial_state = {
+        "application_id": app_id,
+        "customer_id": body.customer_id,
+        "customer_name": body.customer_name,
+        "business_name": body.business_name,
+        "business_ein": body.business_ein,
+        "requested_amount": body.requested_amount,
+        "loan_purpose": body.loan_purpose,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "kyc_status": "pending",
+        "adverse_action_sent": False,
+        "current_node": "start",
+        "session_count": 1,
+        # Optional fields — all None initially
+        "kyc_failure_reason": None,
+        "credit_score": None,
+        "credit_report_summary": None,
+        "fraud_score": None,
+        "fraud_flags": None,
+        "business_verified": None,
+        "business_state": None,
+        "business_incorporation_date": None,
+        "tax_transcripts_received": None,
+        "annual_revenue": None,
+        "underwriting_decision": None,
+        "decline_reasons": None,
+        "auto_decision_rationale": None,
+        "underwriter_id": None,
+        "underwriter_notes": None,
+        "underwriter_decision": None,
+        "underwriter_decided_at": None,
+        "approved_amount": None,
+        "interest_rate": None,
+        "term_months": None,
+        "monthly_payment": None,
+        "offer_generated_at": None,
+        "ecoa_disclosed_at": None,
+        "error_message": None,
+    }
+
+    # Run graph in background — it will checkpoint at each node then pause at interrupt
+    async def _run():
+        try:
+            g = await get_loan_graph()
+            async for _ in g.astream(initial_state, config):
+                pass
+        except Exception as exc:
+            from loguru import logger
+            logger.error(f"[loan:{app_id}] graph error: {exc}")
+
+    asyncio.create_task(_run())
+    return {"application_id": app_id, "status": "processing"}
+
+
+@app.get("/api/loans")
+async def api_list_loans():
+    """List all loan applications with their current status."""
+    from loan.graph import list_applications
+    return await list_applications()
+
+
+@app.get("/api/loans/{application_id}")
+async def api_get_loan(application_id: str):
+    """Get full state of a single loan application."""
+    from loan.graph import get_application_state
+    state = await get_application_state(application_id)
+    if not state:
+        raise HTTPException(404, f"Application '{application_id}' not found")
+    return state
+
+
+@app.post("/api/loans/{application_id}/decision")
+async def api_underwriter_decision(application_id: str, body: UnderwriterDecision):
+    """
+    Underwriter approves or declines a loan that is waiting at the human gate.
+    This resumes the LangGraph from the interrupt point.
+
+    Behind the scenes:
+      loan_graph.update_state() injects the decision into checkpointed state
+      loan_graph.astream() resumes from underwriter_review → next node
+    """
+    from loan.graph import get_loan_graph, get_application_state
+
+    state = await get_application_state(application_id)
+    if not state:
+        raise HTTPException(404, f"Application '{application_id}' not found")
+    if not state.get("_is_interrupted"):
+        raise HTTPException(400, "Application is not currently awaiting underwriter review")
+
+    if body.decision not in ("approved", "declined"):
+        raise HTTPException(422, "decision must be 'approved' or 'declined'")
+
+    loan_graph = await get_loan_graph()
+    config = {"configurable": {"thread_id": application_id}}
+
+    # Inject underwriter's decision into the checkpointed state
+    await loan_graph.aupdate_state(config, {
+        "underwriter_decision": body.decision,
+        "underwriter_id": body.underwriter_id,
+        "underwriter_notes": body.notes,
+    }, as_node="underwriter_review")
+
+    # Resume the graph from the interrupt point
+    async def _resume():
+        try:
+            g = await get_loan_graph()
+            async for _ in g.astream(None, config):
+                pass
+        except Exception as exc:
+            from loguru import logger
+            logger.error(f"[loan:{application_id}] resume error: {exc}")
+
+    asyncio.create_task(_resume())
+    return {"application_id": application_id, "decision": body.decision, "status": "resuming"}
+
+
+# ---------------------------------------------------------------------------
 # Serve React build in production
 # ---------------------------------------------------------------------------
 
