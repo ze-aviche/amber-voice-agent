@@ -38,3 +38,6 @@ Thumbs.db
 
 # Vercel
 .vercel/
+
+# Interview related
+INTERVIEW_PREP.md

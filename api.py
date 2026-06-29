@@ -15,14 +15,17 @@ Run:
     uv run uvicorn api:app --reload --port 8000
 """
 
+import asyncio
+import json
 import os
 import re
 import uuid
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -211,6 +214,97 @@ def api_get_recording(call_id: str):
     if not path.exists():
         raise HTTPException(404, "Recording file not found")
     return FileResponse(str(path), media_type="audio/wav")
+
+
+# ---------------------------------------------------------------------------
+# Live call state — shared between bot.py (writer) and WebSocket (reader)
+# ---------------------------------------------------------------------------
+# call_id → {"transcript": [...], "sentiment": {...}, "outcome": str, "tenant_id": str}
+_live_calls: dict[str, dict[str, Any]] = {}
+
+# WebSocket connections subscribed to a call_id
+_ws_subscribers: dict[str, list[WebSocket]] = {}
+
+
+def publish_call_update(call_id: str, update: dict) -> None:
+    """
+    Called by bot.py (or tools) to push a transcript turn + sentiment reading.
+    Stores the update in _live_calls and queues it for WebSocket broadcast.
+    """
+    if call_id not in _live_calls:
+        _live_calls[call_id] = {"transcript": [], "sentiment": None, "outcome": "active"}
+    state = _live_calls[call_id]
+    if "turn" in update:
+        state["transcript"].append(update["turn"])
+    if "sentiment" in update:
+        state["sentiment"] = update["sentiment"]
+    if "outcome" in update:
+        state["outcome"] = update["outcome"]
+
+    # Fire-and-forget broadcast to connected supervisors
+    subs = _ws_subscribers.get(call_id, [])
+    if subs:
+        payload = json.dumps({**state, "call_id": call_id})
+        asyncio.create_task(_broadcast(call_id, payload))
+
+
+async def _broadcast(call_id: str, payload: str) -> None:
+    dead: list[WebSocket] = []
+    for ws in list(_ws_subscribers.get(call_id, [])):
+        try:
+            await ws.send_text(payload)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        _ws_subscribers.get(call_id, []).remove(ws)
+
+
+@app.websocket("/ws/calls/{call_id}")
+async def ws_call_feed(websocket: WebSocket, call_id: str):
+    """
+    Supervisor dashboard connects here to receive live transcript + sentiment.
+    Messages are JSON: {call_id, transcript, sentiment, outcome}
+
+    Also accepts text messages from the client:
+      {"action": "subscribe"}  — start streaming (sent automatically on connect)
+    """
+    await websocket.accept()
+    _ws_subscribers.setdefault(call_id, []).append(websocket)
+
+    # Send current state immediately on connect
+    if call_id in _live_calls:
+        await websocket.send_text(
+            json.dumps({**_live_calls[call_id], "call_id": call_id})
+        )
+
+    try:
+        while True:
+            # Keep connection alive; data is pushed via publish_call_update
+            await asyncio.sleep(30)
+            await websocket.send_text(json.dumps({"ping": True, "call_id": call_id}))
+    except (WebSocketDisconnect, Exception):
+        subs = _ws_subscribers.get(call_id, [])
+        if websocket in subs:
+            subs.remove(websocket)
+
+
+@app.get("/api/live-calls")
+def api_live_calls():
+    """List all calls currently tracked as active (useful for supervisor overview)."""
+    return [
+        {"call_id": cid, **state}
+        for cid, state in _live_calls.items()
+        if state.get("outcome") == "active"
+    ]
+
+
+@app.get("/api/live-calls/{call_id}")
+def api_live_call(call_id: str):
+    """Snapshot of current live call state (polling fallback for non-WS clients)."""
+    state = _live_calls.get(call_id)
+    if not state:
+        raise HTTPException(404, f"No live call '{call_id}'")
+    return {"call_id": call_id, **state}
 
 
 # ---------------------------------------------------------------------------

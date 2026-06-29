@@ -41,10 +41,11 @@ from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.audio.vad.vad_analyzer import VADParams
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.observers.base_observer import BaseObserver, FramePushed
-from pipecat.frames.frames import MetricsFrame
+from pipecat.frames.frames import MetricsFrame, TranscriptionFrame, TextFrame
 from pipecat.metrics.metrics import TTFBMetricsData, LLMUsageMetricsData
 
 from db import init_db, get_tenant, insert_call, update_call
+from sentiment import analyze_sentiment, needs_supervisor_alert
 
 load_dotenv()
 
@@ -81,6 +82,61 @@ class LatencyObserver(BaseObserver):
         logger.info("\n".join(lines))
 
 
+class SentimentObserver(BaseObserver):
+    """
+    After each LLM text output, re-scores sentiment from the growing transcript
+    and publishes the result to the live call WebSocket feed.
+
+    Uses TranscriptionFrame (user speech→text) and TextFrame (LLM output) to
+    build an in-memory transcript, then calls analyze_sentiment() async.
+    """
+
+    def __init__(self, app_resources: dict):
+        super().__init__()
+        self._resources = app_resources
+        self._pending: list[dict] = []   # turns collected since last score
+
+    async def on_push_frame(self, data: FramePushed) -> None:
+        frame = data.frame
+
+        if isinstance(frame, TranscriptionFrame):
+            turn = {"role": "user", "text": frame.text}
+            self._resources["transcript"].append(turn)
+            self._pending.append(turn)
+
+        elif isinstance(frame, TextFrame) and frame.text.strip():
+            turn = {"role": "assistant", "text": frame.text}
+            self._resources["transcript"].append(turn)
+            self._pending.append(turn)
+
+            # Score after every assistant turn (end of each exchange)
+            if len(self._pending) >= 2:
+                asyncio.create_task(self._score())
+                self._pending = []
+
+    async def _score(self) -> None:
+        transcript = self._resources.get("transcript", [])
+        sentiment = await analyze_sentiment(transcript, window=8)
+        self._resources["sentiment"] = sentiment
+
+        call_id = self._resources.get("call_id", "")
+        if needs_supervisor_alert(sentiment):
+            logger.warning(
+                f"[sentiment] ALERT call={call_id} "
+                f"label={sentiment['label']} score={sentiment['score']:.2f} — {sentiment['reason']}"
+            )
+
+        # Publish to WebSocket subscribers via api.py shared state
+        try:
+            from api import publish_call_update
+            publish_call_update(call_id, {
+                "sentiment": sentiment,
+                "outcome": self._resources.get("outcome", "active"),
+            })
+        except Exception:
+            pass   # api may not be running in the same process in local mode
+
+
 def _load_vertical(vertical: str):
     """Return (build_system_prompt, TOOLS_SCHEMA, TOOL_HANDLERS) for the vertical."""
     if vertical == "dental":
@@ -91,8 +147,12 @@ def _load_vertical(vertical: str):
         from restaurant_persona import build_system_prompt
         from restaurant_tools import TOOLS_SCHEMA, TOOL_HANDLERS
         return build_system_prompt, TOOLS_SCHEMA, TOOL_HANDLERS
+    elif vertical == "banking":
+        from banking_persona import build_system_prompt
+        from banking_tools import TOOLS_SCHEMA, TOOL_HANDLERS
+        return build_system_prompt, TOOLS_SCHEMA, TOOL_HANDLERS
     else:
-        raise ValueError(f"Unknown vertical: {vertical!r}. Must be 'dental' or 'restaurant'.")
+        raise ValueError(f"Unknown vertical: {vertical!r}. Must be 'dental', 'restaurant', or 'banking'.")
 
 
 async def main(tenant_id: str):
@@ -190,9 +250,11 @@ async def main(tenant_id: str):
         "transcript": [],         # appended by tool handlers / context observer
         "outcome": "info",
         "caller_name": None,      # set by tools when patient name is captured
+        "sentiment": {"label": "neutral", "score": 0.5, "reason": "Call just started."},
     }
 
     latency = LatencyObserver()
+    sentiment_obs = SentimentObserver(app_resources)
 
     task = PipelineWorker(
         pipeline,
@@ -200,7 +262,7 @@ async def main(tenant_id: str):
             allow_interruptions=True,
             enable_metrics=True,
         ),
-        observers=[latency],
+        observers=[latency, sentiment_obs],
         app_resources=app_resources,
     )
 
@@ -210,6 +272,16 @@ async def main(tenant_id: str):
     @runner.event_handler("on_ready")
     async def on_ready(runner):
         await recorder.start_recording()
+        # Register this call in the live-call feed so the dashboard sees it
+        try:
+            from api import publish_call_update
+            publish_call_update(call_id, {
+                "outcome": "active",
+                "sentiment": app_resources["sentiment"],
+            })
+            app_resources["_api_publish"] = publish_call_update
+        except Exception:
+            pass
         messages.append(
             {"role": "system", "content": "Greet the caller warmly in one short sentence."}
         )

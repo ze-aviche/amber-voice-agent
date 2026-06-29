@@ -11,6 +11,39 @@ from db import init_db, upsert_tenant
 
 TENANTS = [
     {
+        "id": "first-national-bank",
+        "vertical": "banking",
+        "name": "First National Bank",
+        "location": "Dallas, Texas",
+        "hours": "Monday to Friday, 8am to 6pm. Saturday 9am to 1pm. Closed Sunday.",
+        "phone": "214-555-0300",
+        "services": [
+            "account balances",
+            "recent transactions",
+            "bill payments",
+            "card services",
+            "fraud reporting",
+            "loan inquiries",
+        ],
+        "google_calendar_id": "primary",
+        "emergency_triage": (
+            "If the caller reports unauthorized transactions, a lost or stolen card, "
+            "or any suspected fraud, immediately tell them you are connecting them to "
+            "the Fraud Prevention team and call transfer_to_human with urgency=fraud."
+        ),
+        "human_handoff": (
+            "If the caller asks for a human, is upset, or has a complex issue you "
+            "cannot resolve, offer to transfer them to a live banking specialist."
+        ),
+        "config": {
+            "fraud_hotline": "1-800-555-3728",
+            "demo_hint": (
+                "Demo cards: last4=4444 phone=7890 (James Carter), "
+                "last4=3333 phone=4567 (Maria Chen)"
+            ),
+        },
+    },
+    {
         "id": "bright-smile-dental",
         "vertical": "dental",
         "name": "Bright Smile Dental",
@@ -75,5 +108,5 @@ if __name__ == "__main__":
     init_db()
     for t in TENANTS:
         upsert_tenant(t)
-        print(f"✓ Seeded tenant: {t['id']} ({t['vertical']})")
+        print(f"[ok] Seeded tenant: {t['id']} ({t['vertical']})")
     print("\nDone. Run 'uv run bot.py --tenant bright-smile-dental' to test.")
